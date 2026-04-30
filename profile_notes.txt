@@ -1,0 +1,9 @@
+"""
+Public profile endpoints — view another user's public activity:
+- their comments (recent 20)
+- their ratings (recent 20)
+- counts
+
+Privacy: returns only user_name + activity. No emails. Banned users excluded.
+"""
+# This file's intentionally simple — endpoints already added to server.py
