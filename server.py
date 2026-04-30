@@ -1467,7 +1467,11 @@ async def security_headers_middleware(request: Request, call_next):
 # ---------------------------------------------------------------------------
 app.include_router(api_router)
 
-_cors_origins = [o.strip() for o in os.environ.get('CORS_ORIGINS', 'http://localhost:3000,http://localhost:3001,http://localhost:3002').split(',') if o.strip()]
+_cors_env = os.environ.get('CORS_ORIGINS', '').strip()
+if _cors_env:
+    _cors_origins = [o.strip() for o in _cors_env.split(',') if o.strip()]
+else:
+    _cors_origins = ['*']
 _allow_all = '*' in _cors_origins
 
 app.add_middleware(
