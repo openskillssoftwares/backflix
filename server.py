@@ -88,7 +88,15 @@ class AsyncCollection:
 
     async def _persist(self):
         async with self._lock:
-            self._path.write_text(__import__("json").dumps(self._docs, default=str))
+            txt = __import__("json").dumps(self._docs, default=str)
+            # atomic write: write to temp file then replace
+            tmp = self._path.with_suffix(self._path.suffix + ".tmp")
+            tmp.write_text(txt)
+            try:
+                tmp.replace(self._path)
+            except Exception:
+                # fallback to overwrite
+                self._path.write_text(txt)
 
     async def find(self, filter: Optional[Dict[str, Any]] = None, sort: Optional[List] = None, limit: Optional[int] = None):
         def matches(doc, filt):
@@ -236,6 +244,7 @@ db.notifications = notifications
 # ---------------------------------------------------------------------------
 class CommentIn(BaseModel):
     body: Annotated[str, Field(min_length=1, max_length=2000)]
+    parent_id: Optional[str] = None
 
 
 class CommentOut(BaseModel):
@@ -244,7 +253,9 @@ class CommentOut(BaseModel):
     user_id: str
     user_name: str
     body: str
+    parent_id: Optional[str] = None
     created_at: datetime
+    edited_at: Optional[datetime] = None
     approved: bool = True
 
 
@@ -423,7 +434,10 @@ async def list_comments(mal_id: int):
     return [CommentOut(**{
         "id": r["id"], "mal_id": r["mal_id"], "user_id": r["user_id"],
         "user_name": r.get("user_name", "anon"), "body": r["body"],
-        "created_at": r["created_at"], "approved": r.get("approved", True),
+        "parent_id": r.get("parent_id"),
+        "created_at": r["created_at"],
+        "edited_at": r.get("edited_at"),
+        "approved": r.get("approved", True),
     }) for r in rows]
 
 
@@ -436,12 +450,37 @@ async def create_comment(mal_id: int, payload: CommentIn, request: Request,
         "user_id": user.id,
         "user_name": user.name,
         "body": payload.body,
+        "parent_id": payload.parent_id,
         "created_at": datetime.utcnow(),
         "approved": True,
         "deleted": False,
     }
     await db.comments.insert_one(doc)
     return CommentOut(**doc)
+
+
+@api_router.put("/comments/{comment_id}")
+async def edit_comment(comment_id: str, payload: CommentIn, request: Request,
+                       user: AuthedUser = Depends(get_current_user)):
+    row = await db.comments.find_one({"id": comment_id})
+    if not row:
+        raise HTTPException(status_code=404, detail="Not found")
+    is_owner = row.get("user_id") == user.id
+    if not is_owner and not (user.is_admin):
+        raise HTTPException(status_code=403, detail="Not allowed")
+    await db.comments.update_one({"id": comment_id}, {"$set": {"body": payload.body, "edited_at": datetime.utcnow()}})
+    updated = await db.comments.find_one({"id": comment_id})
+    return CommentOut(**{
+        "id": updated["id"],
+        "mal_id": updated["mal_id"],
+        "user_id": updated["user_id"],
+        "user_name": updated.get("user_name", "anon"),
+        "body": updated["body"],
+        "parent_id": updated.get("parent_id"),
+        "created_at": updated.get("created_at"),
+        "edited_at": updated.get("edited_at"),
+        "approved": updated.get("approved", True),
+    })
 
 
 @api_router.delete("/comments/{comment_id}")
