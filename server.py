@@ -1013,16 +1013,26 @@ async def _anilist_for_jikan_path(path: str, request: Request) -> Optional[Dict[
 async def jikan_proxy(path: str, request: Request):
     qs = request.url.query
     cache_key = f"jikan:{path}?{qs}"
+    is_catalog_list = path.startswith(("top/", "seasons/", "anime"))
 
     fresh = await _cache_get(cache_key)
     if fresh is not None:
         return fresh
 
+    # Prioritize time-to-first-content for homepage/browse lists.
+    # If we have stale cache, serve it immediately instead of waiting on upstream.
+    if is_catalog_list:
+        stale = await _cache_get(cache_key, allow_stale=True)
+        if stale is not None:
+            return stale
+
     url = f"{JIKAN_BASE}/{path}"
     last_status = 0
-    for attempt in range(2):
+    max_attempts = 1 if is_catalog_list else 2
+    upstream_timeout = 6.0 if is_catalog_list else 12.0
+    for attempt in range(max_attempts):
         try:
-            async with httpx.AsyncClient(timeout=15.0,
+            async with httpx.AsyncClient(timeout=upstream_timeout,
                                          headers={"User-Agent": "Lumen/1.0"}) as http:
                 r = await http.get(url, params=dict(request.query_params))
             last_status = r.status_code
@@ -1050,9 +1060,9 @@ async def jikan_proxy(path: str, request: Request):
             empty = {"data": []}
             await _cache_set(cache_key, empty, ttl_seconds=300)
             return empty
-        # 429 / 500 → small backoff & retry once
+        # 429 / 500 → small backoff before retry.
         import asyncio
-        await asyncio.sleep(0.7)
+        await asyncio.sleep(0.25)
 
     # All retries failed → try AniList fallback
     al = await _anilist_for_jikan_path(path, request)
