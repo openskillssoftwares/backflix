@@ -25,6 +25,7 @@ from typing import List, Optional, Dict, Any, Annotated
 import uuid
 from datetime import datetime
 import httpx
+from supabase import create_client as _create_supabase_client
 
 # In-memory fallback cache used when MongoDB is not available (development)
 IN_MEMORY_CACHE: Dict[str, Dict[str, Any]] = {}
@@ -38,8 +39,17 @@ load_dotenv(ROOT_DIR / '.env')
 DB_NAME = os.environ.get('DB_NAME', 'anime_stream')
 SUPABASE_URL = os.environ.get('SUPABASE_URL', '').rstrip('/')
 SUPABASE_ANON_KEY = os.environ.get('SUPABASE_ANON_KEY', '')
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get('SUPABASE_SERVICE_ROLE_KEY', '')
 ADMIN_EMAIL = os.environ.get('ADMIN_EMAIL', 'admin@lumen.local').lower()
 
+# Optional Supabase service client used for server-side writes (requires SERVICE_ROLE_KEY)
+SUPABASE_SERVICE = None
+if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
+    try:
+        SUPABASE_SERVICE = _create_supabase_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+        logger.info("Supabase service client initialized")
+    except Exception:
+        SUPABASE_SERVICE = None
 
 app = FastAPI(title="Lumen API")
 api_router = APIRouter(prefix="/api")
@@ -456,6 +466,23 @@ async def create_comment(mal_id: int, payload: CommentIn, request: Request,
         "deleted": False,
     }
     await db.comments.insert_one(doc)
+    # Mirror to Supabase in background (best-effort)
+    if SUPABASE_SERVICE:
+        try:
+            asyncio.create_task(asyncio.to_thread(lambda: SUPABASE_SERVICE.table('comments').insert({
+                'id': doc['id'],
+                'user_id': doc['user_id'],
+                'user_name': doc['user_name'],
+                'mal_id': doc['mal_id'],
+                'body': doc['body'],
+                'parent_id': doc.get('parent_id'),
+                'approved': doc['approved'],
+                'deleted': doc['deleted'],
+                'created_at': doc['created_at'].isoformat(),
+                'edited_at': None,
+            }).execute()))
+        except Exception:
+            logger.exception("Supabase mirror insert failed")
     return CommentOut(**doc)
 
 
@@ -470,6 +497,15 @@ async def edit_comment(comment_id: str, payload: CommentIn, request: Request,
         raise HTTPException(status_code=403, detail="Not allowed")
     await db.comments.update_one({"id": comment_id}, {"$set": {"body": payload.body, "edited_at": datetime.utcnow()}})
     updated = await db.comments.find_one({"id": comment_id})
+    # Mirror edit to Supabase
+    if SUPABASE_SERVICE:
+        try:
+            asyncio.create_task(asyncio.to_thread(lambda: SUPABASE_SERVICE.table('comments').update({
+                'body': updated['body'],
+                'edited_at': updated.get('edited_at').isoformat() if updated.get('edited_at') else None,
+            }).eq('id', comment_id).execute()))
+        except Exception:
+            logger.exception("Supabase mirror update failed")
     return CommentOut(**{
         "id": updated["id"],
         "mal_id": updated["mal_id"],
@@ -491,6 +527,14 @@ async def delete_comment(comment_id: str, user: AuthedUser = Depends(get_current
     if row["user_id"] != user.id and not user.is_admin:
         raise HTTPException(status_code=403, detail="Not allowed")
     await db.comments.update_one({"id": comment_id}, {"$set": {"deleted": True}})
+    # Mirror deletion flag to Supabase
+    if SUPABASE_SERVICE:
+        try:
+            asyncio.create_task(asyncio.to_thread(lambda: SUPABASE_SERVICE.table('comments').update({
+                'deleted': True
+            }).eq('id', comment_id).execute()))
+        except Exception:
+            logger.exception("Supabase mirror delete failed")
     return {"ok": True}
 
 
@@ -599,22 +643,23 @@ async def _resolve_user_name(user_id: str) -> Optional[str]:
     return None
 
 
+async def _progress_unique_count(user_id: str) -> int:
+    rows = await db.progress.find({"user_id": user_id}, limit=None)
+    return len({r.get("mal_id") for r in rows if r.get("mal_id") is not None})
+
+
 @api_router.get("/users/{user_id}/profile", response_model=PublicProfileOut)
 async def public_profile(user_id: str):
     if await db.banned_users.find_one({"user_id": user_id}):
         raise HTTPException(status_code=404, detail="Profile not found")
-    name = await _resolve_user_name(user_id)
-    if not name:
-        # Maybe a real user with no activity yet — return a minimal stub so
-        # /profile/me works for fresh accounts.
-        comments = ratings = progress = 0
-    else:
-        comments, ratings, progress = await asyncio.gather(
-            db.comments.count_documents({"user_id": user_id, "deleted": {"$ne": True}}),
-            db.ratings.count_documents({"user_id": user_id}),
-            db.progress.count_documents({"user_id": user_id}),
-        )
-    if not name and not (comments or ratings or progress):
+    profile = await db.profiles.find_one({"user_id": user_id})
+    name = (profile or {}).get("display_name") or await _resolve_user_name(user_id)
+    comments, ratings = await asyncio.gather(
+        db.comments.count_documents({"user_id": user_id, "deleted": {"$ne": True}}),
+        db.ratings.count_documents({"user_id": user_id}),
+    )
+    progress = await _progress_unique_count(user_id)
+    if not name and not (comments or ratings or progress or profile):
         raise HTTPException(status_code=404, detail="Profile not found")
 
     # First seen ts: oldest activity row across collections.
@@ -630,7 +675,7 @@ async def public_profile(user_id: str):
 
     return PublicProfileOut(
         user_id=user_id,
-        user_name=name or "anon",
+        user_name=name or (profile or {}).get("mal_username") or "anon",
         is_admin=False,
         joined_at=first_ts.isoformat() if first_ts else None,
         counts={"comments": comments, "ratings": ratings, "progress": progress},
@@ -697,7 +742,9 @@ async def public_user_comments(user_id: str, limit: int = 30):
     return [CommentOut(**{
         "id": r["id"], "mal_id": r["mal_id"], "user_id": r["user_id"],
         "user_name": r.get("user_name", "anon"), "body": r["body"],
+        "parent_id": r.get("parent_id"),
         "created_at": r["created_at"], "approved": r.get("approved", True),
+        "edited_at": r.get("edited_at"),
     }) for r in rows]
 
 
@@ -1474,6 +1521,24 @@ async def save_progress(payload: ProgressIn,
          "$setOnInsert": {"id": str(uuid.uuid4()), "created_at": datetime.utcnow()}},
         upsert=True,
     )
+    # Mirror progress to Supabase (upsert)
+    if SUPABASE_SERVICE:
+        try:
+            sup_row = {
+                'user_id': user.id,
+                'mal_id': payload.mal_id,
+                'episode': payload.episode,
+                'current_time': payload.current_time,
+                'duration': payload.duration,
+                'percent': payload.percent,
+                'completed': payload.completed,
+                'title': payload.title,
+                'image_url': payload.image_url,
+                'updated_at': datetime.utcnow().isoformat(),
+            }
+            asyncio.create_task(asyncio.to_thread(lambda: SUPABASE_SERVICE.table('progress').upsert(sup_row).execute()))
+        except Exception:
+            logger.exception("Supabase mirror progress failed")
     return {"ok": True}
 
 
