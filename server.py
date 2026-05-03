@@ -1,3 +1,18 @@
+"""
+Lumen anime backend — comments, ratings, admin moderation, security stubs.
+
+Auth model:
+- Users are stored & authenticated by Supabase (frontend uses Supabase JS).
+- This backend validates the user's Supabase JWT by calling
+  https://{SUPABASE_URL}/auth/v1/user with the token. No JWT secret needed.
+- Admin = user whose Supabase email == ADMIN_EMAIL env.
+
+Storage: MongoDB collections
+- comments       : per-anime comments
+- ratings        : per-user per-anime 1..5 stars
+- banned_users   : list of banned supabase user_ids
+- banned_anime   : list of banned mal_ids (cannot be streamed)
+"""
 from fastapi import FastAPI, APIRouter, HTTPException, Header, Depends, Request
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
@@ -220,6 +235,8 @@ progress = AsyncCollection("progress", DATA_DIR)
 proxy_cache = AsyncCollection("proxy_cache", DATA_DIR)
 anikoto_mal_index = AsyncCollection("anikoto_mal_index", DATA_DIR)
 notifications = AsyncCollection("notifications", DATA_DIR)
+profiles = AsyncCollection("profiles", DATA_DIR)
+reports = AsyncCollection("reports", DATA_DIR)
 
 # db shim matching previous attribute access
 class DBShim:
@@ -236,6 +253,8 @@ db.progress = progress
 db.proxy_cache = proxy_cache
 db.anikoto_mal_index = anikoto_mal_index
 db.notifications = notifications
+db.profiles = profiles
+db.reports = reports
 
 
 
@@ -284,6 +303,29 @@ class NotificationIn(BaseModel):
     body: Annotated[str, Field(min_length=3, max_length=2000)]
     level: Annotated[str, Field(min_length=3, max_length=16)] = "info"
     target: Annotated[str, Field(min_length=3, max_length=16)] = "all"
+
+
+class ReportIn(BaseModel):
+    mal_id: int
+    episode: int = 1
+    lang: Annotated[str, Field(min_length=3, max_length=8)] = "sub"
+    source: Optional[str] = "mal"
+    anikoto_id: Optional[int] = None
+    reported_url: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class ReportOut(BaseModel):
+    id: str
+    mal_id: int
+    episode: int
+    lang: str
+    source: str
+    reported_url: Optional[str] = None
+    created_at: datetime
+    user_id: Optional[str] = None
+    user_name: Optional[str] = None
+    probe_ok: Optional[bool] = None
 
 
 class AuthedUser(BaseModel):
@@ -664,7 +706,24 @@ async def _progress_unique_count(user_id: str) -> int:
 async def public_profile(user_id: str):
     if await db.banned_users.find_one({"user_id": user_id}):
         raise HTTPException(status_code=404, detail="Profile not found")
-    profile = await db.profiles.find_one({"user_id": user_id})
+    profile = None
+    # Prefer Supabase profiles if a service client is configured (frontend writes directly).
+    if SUPABASE_SERVICE is not None:
+        try:
+            sup_res = SUPABASE_SERVICE.table('profiles').select('display_name,mal_username').eq('user_id', user_id).maybe_single().execute()
+            data = None
+            try:
+                data = getattr(sup_res, 'data', None) or (sup_res.get('data') if isinstance(sup_res, dict) else None)
+            except Exception:
+                data = None
+            if data:
+                profile = {'user_id': user_id, 'display_name': data.get('display_name'), 'mal_username': data.get('mal_username')}
+        except Exception:
+            logger.exception("Supabase profile lookup failed")
+
+    if not profile:
+        profile = await db.profiles.find_one({"user_id": user_id})
+
     name = (profile or {}).get("display_name") or await _resolve_user_name(user_id)
     comments, ratings = await asyncio.gather(
         db.comments.count_documents({"user_id": user_id, "deleted": {"$ne": True}}),
@@ -792,6 +851,17 @@ async def admin_stats(_: AuthedUser = Depends(require_admin)):
 async def admin_list_users(_: AuthedUser = Depends(require_admin)):
     """Return users seen via comments/ratings + banned status."""
     seen: Dict[str, Dict[str, Any]] = {}
+    profiles_rows = await db.profiles.find({}, limit=None)
+    for p in profiles_rows:
+        uid = p.get("user_id")
+        if not uid:
+            continue
+        seen[uid] = {
+            "user_id": uid,
+            "name": p.get("display_name") or p.get("mal_username") or seen.get(uid, {}).get("name", ""),
+            "comments": seen.get(uid, {}).get("comments", 0),
+            "ratings": seen.get(uid, {}).get("ratings", 0),
+        }
     comments_all = await db.comments.find({}, limit=None)
     for r in comments_all:
         uid = r.get("user_id")
@@ -817,6 +887,25 @@ async def admin_list_users(_: AuthedUser = Depends(require_admin)):
             out.append({"user_id": b["user_id"], "name": b.get("name", ""),
                         "banned": True, "comments": 0, "ratings": 0})
     return out
+
+
+@api_router.get("/admin/ratings")
+async def admin_list_ratings(_: AuthedUser = Depends(require_admin)):
+    rows = await db.ratings.find({}, sort=[("updated_at", -1)], limit=1000)
+    return [{
+        "id": r.get("id"),
+        "user_id": r.get("user_id"),
+        "mal_id": r.get("mal_id"),
+        "score": r.get("score"),
+        "created_at": r.get("created_at"),
+        "updated_at": r.get("updated_at"),
+    } for r in rows]
+
+
+@api_router.get("/admin/flags")
+async def admin_list_flags(_: AuthedUser = Depends(require_admin)):
+    rows = await db.security_log.find({}, sort=[("created_at", -1)], limit=500)
+    return rows
 
 
 @api_router.post("/admin/users/ban")
@@ -869,6 +958,12 @@ async def admin_list_comments(_: AuthedUser = Depends(require_admin)):
         "created_at": r["created_at"], "approved": r.get("approved", True),
         "deleted": r.get("deleted", False),
     } for r in rows]
+
+
+@api_router.get("/admin/reports")
+async def admin_list_reports(_: AuthedUser = Depends(require_admin)):
+    rows = await db.reports.find({}, sort=[("created_at", -1)], limit=500)
+    return rows
 
 
 @api_router.post("/admin/comments/{comment_id}/approve")
@@ -1363,6 +1458,49 @@ class StreamOut(BaseModel):
     title: Optional[str] = None
 
 
+async def _probe_stream_url(url: str) -> bool:
+    try:
+        async with httpx.AsyncClient(timeout=4.0, follow_redirects=True) as http:
+            res = await http.get(url, headers={"User-Agent": "Lumen/1.0"})
+        return 200 <= res.status_code < 400
+    except Exception:
+        return False
+
+
+async def _build_anikoto_stream(mal_id: int, ep: int, lang: str, anikoto_id: int) -> StreamOut:
+    series = await _anikoto_series_cached(anikoto_id)
+    episodes = (series or {}).get("episodes") or []
+    chosen = None
+    for e in episodes:
+        num = e.get("number") or e.get("episode_number") or e.get("ep_num")
+        try:
+            if num is not None and int(num) == ep:
+                chosen = e
+                break
+        except (TypeError, ValueError):
+            pass
+    if chosen is None and 0 < ep <= len(episodes):
+        chosen = episodes[ep - 1]
+    if chosen is None:
+        raise HTTPException(status_code=404, detail="Episode not found in Anikoto series")
+
+    embed_id = (chosen.get("episode_embed_id")
+                or chosen.get("embed_id")
+                or chosen.get("id"))
+    if not embed_id:
+        emb = chosen.get("embed_url") or {}
+        url = emb.get(lang) or emb.get("sub") or emb.get("dub")
+        if url:
+            return StreamOut(embed_url=url, source="anikoto", mal_id=mal_id,
+                             episode=ep, lang=lang, title=chosen.get("title"))
+        raise HTTPException(status_code=502, detail="No embed id from Anikoto")
+
+    url = f"{MEGAPLAY_BASE}/stream/s-2/{embed_id}/{lang}"
+    return StreamOut(embed_url=url, source="anikoto", mal_id=mal_id,
+                     episode=ep, lang=lang, episode_embed_id=str(embed_id),
+                     title=chosen.get("title"))
+
+
 @api_router.get("/stream", response_model=StreamOut)
 async def get_stream(mal_id: int, ep: int = 1, lang: str = "sub",
                      source: str = "mal", anikoto_id: Optional[int] = None):
@@ -1376,44 +1514,76 @@ async def get_stream(mal_id: int, ep: int = 1, lang: str = "sub",
 
     if source == "mal":
         url = f"{MEGAPLAY_BASE}/stream/mal/{mal_id}/{ep}/{lang}"
+        if await _probe_stream_url(url):
+            return StreamOut(embed_url=url, source="mal", mal_id=mal_id, episode=ep, lang=lang)
+        try:
+            resolved = await anikoto_resolve(mal_id)
+            aid = resolved.get("anikoto_id") if isinstance(resolved, dict) else None
+            if aid:
+                return await _build_anikoto_stream(mal_id, ep, lang, int(aid))
+        except Exception:
+            logger.exception("Stream fallback resolution failed for mal_id=%s ep=%s", mal_id, ep)
         return StreamOut(embed_url=url, source="mal", mal_id=mal_id, episode=ep, lang=lang)
 
     if source == "anikoto":
         if not anikoto_id:
             raise HTTPException(status_code=400, detail="anikoto_id required for anikoto source")
-        series = await _anikoto_series_cached(anikoto_id)
-        episodes = (series or {}).get("episodes") or []
-        # find by episode number; fall back to position
-        chosen = None
-        for e in episodes:
-            num = e.get("number") or e.get("episode_number") or e.get("ep_num")
-            try:
-                if num is not None and int(num) == ep:
-                    chosen = e
-                    break
-            except (TypeError, ValueError):
-                pass
-        if chosen is None and 0 < ep <= len(episodes):
-            chosen = episodes[ep - 1]
-        if chosen is None:
-            raise HTTPException(status_code=404, detail="Episode not found in Anikoto series")
-        embed_id = (chosen.get("episode_embed_id")
-                    or chosen.get("embed_id")
-                    or chosen.get("id"))
-        if not embed_id:
-            # try embed_url first
-            emb = chosen.get("embed_url") or {}
-            url = emb.get(lang) or emb.get("sub") or emb.get("dub")
-            if url:
-                return StreamOut(embed_url=url, source="anikoto", mal_id=mal_id,
-                                 episode=ep, lang=lang, title=chosen.get("title"))
-            raise HTTPException(status_code=502, detail="No embed id from Anikoto")
-        url = f"{MEGAPLAY_BASE}/stream/s-2/{embed_id}/{lang}"
-        return StreamOut(embed_url=url, source="anikoto", mal_id=mal_id,
-                         episode=ep, lang=lang, episode_embed_id=str(embed_id),
-                         title=chosen.get("title"))
+        return await _build_anikoto_stream(mal_id, ep, lang, anikoto_id)
 
     raise HTTPException(status_code=400, detail="Unknown source")
+
+
+@api_router.post("/reports/stream", response_model=ReportOut)
+async def report_stream(payload: ReportIn, user: AuthedUser = Depends(get_current_user)):
+    """Report a broken or unavailable stream. Server will attempt to probe the expected URL and record the outcome."""
+    # Try to build the canonical stream URL via existing helper
+    server_url = None
+    try:
+        so = await get_stream(payload.mal_id, payload.episode, payload.lang or "sub", payload.source or "mal", payload.anikoto_id)
+        server_url = so.embed_url if so and getattr(so, 'embed_url', None) else None
+    except Exception:
+        server_url = None
+
+    probe_ok = False
+    url_to_probe = (payload.reported_url or server_url)
+    if url_to_probe:
+        try:
+            probe_ok = await _probe_stream_url(url_to_probe)
+        except Exception:
+            probe_ok = False
+
+    doc = {
+        "id": str(uuid.uuid4()),
+        "mal_id": payload.mal_id,
+        "episode": payload.episode,
+        "lang": payload.lang,
+        "source": payload.source or "mal",
+        "anikoto_id": payload.anikoto_id,
+        "reported_url": payload.reported_url or None,
+        "server_url": server_url,
+        "probe_ok": probe_ok,
+        "notes": payload.notes or "",
+        "user_id": user.id,
+        "user_name": user.name,
+        "created_at": datetime.utcnow(),
+    }
+    await db.reports.insert_one(doc)
+
+    # Mirror to Supabase reports table if service client exists
+    if SUPABASE_SERVICE:
+        try:
+            asyncio.create_task(asyncio.to_thread(lambda: SUPABASE_SERVICE.table('reports').insert({
+                'id': doc['id'], 'mal_id': doc['mal_id'], 'episode': doc['episode'],
+                'lang': doc['lang'], 'source': doc['source'], 'anikoto_id': doc.get('anikoto_id'),
+                'reported_url': doc.get('reported_url'), 'server_url': doc.get('server_url'),
+                'probe_ok': doc.get('probe_ok'), 'notes': doc.get('notes'),
+                'user_id': doc.get('user_id'), 'user_name': doc.get('user_name'),
+                'created_at': doc['created_at'].isoformat(),
+            }).execute()))
+        except Exception:
+            logger.exception("Supabase mirror insert failed for report")
+
+    return ReportOut(**doc)
 
 
 # ---------------------------------------------------------------------------
@@ -1622,6 +1792,7 @@ async def _startup():
         await db.proxy_cache.load()
         await db.anikoto_mal_index.load()
         await db.notifications.load()
+        await db.profiles.load()
         logger.info("Lumen API ready (file-backed storage). Admin email: %s", ADMIN_EMAIL)
     except Exception as e:
         logger.warning("Failed loading file-backed collections: %s", e)
@@ -1640,5 +1811,6 @@ async def shutdown_db_client():
         await db.proxy_cache._persist()
         await db.anikoto_mal_index._persist()
         await db.notifications._persist()
+        await db.profiles._persist()
     except Exception:
         pass
