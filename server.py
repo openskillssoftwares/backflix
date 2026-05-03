@@ -1,31 +1,21 @@
-"""
-Lumen anime backend — comments, ratings, admin moderation, security stubs.
-
-Auth model:
-- Users are stored & authenticated by Supabase (frontend uses Supabase JS).
-- This backend validates the user's Supabase JWT by calling
-  https://{SUPABASE_URL}/auth/v1/user with the token. No JWT secret needed.
-- Admin = user whose Supabase email == ADMIN_EMAIL env.
-
-Storage: MongoDB collections
-- comments       : per-anime comments
-- ratings        : per-user per-anime 1..5 stars
-- banned_users   : list of banned supabase user_ids
-- banned_anime   : list of banned mal_ids (cannot be streamed)
-"""
 from fastapi import FastAPI, APIRouter, HTTPException, Header, Depends, Request
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 import os
 import logging
 import asyncio
+import importlib
 from pathlib import Path
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any, Annotated
 import uuid
 from datetime import datetime
 import httpx
-from supabase import create_client as _create_supabase_client
+
+try:
+    _create_supabase_client = importlib.import_module("supabase").create_client
+except Exception:  # pragma: no cover - optional dependency in local analysis
+    _create_supabase_client = None
 
 # In-memory fallback cache used when MongoDB is not available (development)
 IN_MEMORY_CACHE: Dict[str, Dict[str, Any]] = {}
@@ -42,9 +32,13 @@ SUPABASE_ANON_KEY = os.environ.get('SUPABASE_ANON_KEY', '')
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get('SUPABASE_SERVICE_ROLE_KEY', '')
 ADMIN_EMAIL = os.environ.get('ADMIN_EMAIL', 'admin@lumen.local').lower()
 
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger("lumen")
+
 # Optional Supabase service client used for server-side writes (requires SERVICE_ROLE_KEY)
 SUPABASE_SERVICE = None
-if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
+if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY and _create_supabase_client is not None:
     try:
         SUPABASE_SERVICE = _create_supabase_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
         logger.info("Supabase service client initialized")
@@ -53,10 +47,6 @@ if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
 
 app = FastAPI(title="Lumen API")
 api_router = APIRouter(prefix="/api")
-
-logging.basicConfig(level=logging.INFO,
-                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger("lumen")
 
 
 # ---------------------------------------------------------------------------
@@ -390,7 +380,29 @@ async def _supabase_auth_request(path: str, payload: Dict[str, Any]) -> Dict[str
     if res.status_code >= 400:
         message = data.get("msg") or data.get("message") or data.get("error_description") or data.get("error") or "Authentication failed"
         raise HTTPException(status_code=res.status_code, detail=message)
-    return data
+    session = None
+    if isinstance(data, dict) and (data.get("access_token") or data.get("refresh_token")):
+        session = {
+            "access_token": data.get("access_token"),
+            "refresh_token": data.get("refresh_token"),
+            "expires_in": data.get("expires_in"),
+            "token_type": data.get("token_type"),
+        }
+
+    user = None
+    if isinstance(data, dict) and isinstance(data.get("user"), dict):
+        user_obj = data["user"]
+        user = {
+            "id": user_obj.get("id"),
+            "email": user_obj.get("email"),
+        }
+
+    return {
+        **(data if isinstance(data, dict) else {}),
+        "session": session,
+        "user": user,
+        "message": data.get("message") if isinstance(data, dict) else None,
+    }
 
 
 # ---------------------------------------------------------------------------
