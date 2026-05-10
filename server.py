@@ -490,16 +490,32 @@ async def is_anime_blocked(mal_id: int):
 # ---------------------------------------------------------------------------
 @api_router.get("/comments/{mal_id}", response_model=List[CommentOut])
 async def list_comments(mal_id: int):
-    rows = await db.comments.find(
-        {"mal_id": mal_id, "approved": {"$ne": False}, "deleted": {"$ne": True}},
-        sort=[("created_at", -1)],
-        limit=200,
-    )
+    # Read comments from Supabase only. Do NOT fall back to file-backed storage.
+    rows = []
+    if not SUPABASE_SERVICE:
+        logger.warning("Supabase service not configured; returning empty comments list")
+        return []
+
+    try:
+        result = await asyncio.to_thread(lambda: SUPABASE_SERVICE.table('comments')
+            .select('*')
+            .eq('mal_id', mal_id)
+            .neq('approved', False)
+            .neq('deleted', True)
+            .order('created_at', desc=True)
+            .limit(200)
+            .execute())
+        rows = result.data if result and hasattr(result, 'data') else []
+    except Exception as e:
+        logger.exception(f"Supabase read for comments failed: {e}")
+        # Do not fall back to file-backed storage per request; return empty list
+        return []
+
     return [CommentOut(**{
         "id": r["id"], "mal_id": r["mal_id"], "user_id": r["user_id"],
         "user_name": r.get("user_name", "anon"), "body": r["body"],
         "parent_id": r.get("parent_id"),
-        "created_at": r["created_at"],
+        "created_at": r.get("created_at"),
         "edited_at": r.get("edited_at"),
         "approved": r.get("approved", True),
     }) for r in rows]
@@ -520,10 +536,10 @@ async def create_comment(mal_id: int, payload: CommentIn, request: Request,
         "deleted": False,
     }
     await db.comments.insert_one(doc)
-    # Mirror to Supabase in background (best-effort)
+    # Mirror to Supabase (blocking to ensure persistence)
     if SUPABASE_SERVICE:
         try:
-            asyncio.create_task(asyncio.to_thread(lambda: SUPABASE_SERVICE.table('comments').insert({
+            await asyncio.to_thread(lambda: SUPABASE_SERVICE.table('comments').insert({
                 'id': doc['id'],
                 'user_id': doc['user_id'],
                 'user_name': doc['user_name'],
@@ -534,9 +550,9 @@ async def create_comment(mal_id: int, payload: CommentIn, request: Request,
                 'deleted': doc['deleted'],
                 'created_at': doc['created_at'].isoformat(),
                 'edited_at': None,
-            }).execute()))
-        except Exception:
-            logger.exception("Supabase mirror insert failed")
+            }).execute())
+        except Exception as e:
+            logger.exception(f"Supabase mirror insert failed: {e}")
     return CommentOut(**doc)
 
 
@@ -554,12 +570,12 @@ async def edit_comment(comment_id: str, payload: CommentIn, request: Request,
     # Mirror edit to Supabase
     if SUPABASE_SERVICE:
         try:
-            asyncio.create_task(asyncio.to_thread(lambda: SUPABASE_SERVICE.table('comments').update({
+            await asyncio.to_thread(lambda: SUPABASE_SERVICE.table('comments').update({
                 'body': updated['body'],
                 'edited_at': updated.get('edited_at').isoformat() if updated.get('edited_at') else None,
-            }).eq('id', comment_id).execute()))
-        except Exception:
-            logger.exception("Supabase mirror update failed")
+            }).eq('id', comment_id).execute())
+        except Exception as e:
+            logger.exception(f"Supabase mirror update failed: {e}")
     return CommentOut(**{
         "id": updated["id"],
         "mal_id": updated["mal_id"],
@@ -584,11 +600,11 @@ async def delete_comment(comment_id: str, user: AuthedUser = Depends(get_current
     # Mirror deletion flag to Supabase
     if SUPABASE_SERVICE:
         try:
-            asyncio.create_task(asyncio.to_thread(lambda: SUPABASE_SERVICE.table('comments').update({
+            await asyncio.to_thread(lambda: SUPABASE_SERVICE.table('comments').update({
                 'deleted': True
-            }).eq('id', comment_id).execute()))
-        except Exception:
-            logger.exception("Supabase mirror delete failed")
+            }).eq('id', comment_id).execute())
+        except Exception as e:
+            logger.exception(f"Supabase mirror delete failed: {e}")
     return {"ok": True}
 
 
@@ -597,19 +613,50 @@ async def delete_comment(comment_id: str, user: AuthedUser = Depends(get_current
 # ---------------------------------------------------------------------------
 @api_router.get("/ratings/{mal_id}", response_model=RatingStats)
 async def get_rating(mal_id: int, authorization: Optional[str] = Header(None)):
-    pipeline = [
-        {"$match": {"mal_id": mal_id}},
-        {"$group": {"_id": "$mal_id", "avg": {"$avg": "$score"}, "count": {"$sum": 1}}},
-    ]
-    agg = await db.ratings.aggregate(pipeline).to_list(1)
-    avg = round(agg[0]["avg"], 2) if agg else 0.0
-    count = agg[0]["count"] if agg else 0
+    # Try Supabase first
+    ratings_data = []
+    if SUPABASE_SERVICE:
+        try:
+            result = await asyncio.to_thread(lambda: SUPABASE_SERVICE.table('ratings')
+                .select('score')
+                .eq('mal_id', mal_id)
+                .execute())
+            ratings_data = result.data if result and hasattr(result, 'data') else []
+        except Exception as e:
+            logger.info(f"Supabase ratings read failed, falling back to file-backed: {e}")
+    
+    # Fallback to file-backed storage
+    if not ratings_data:
+        pipeline = [
+            {"$match": {"mal_id": mal_id}},
+            {"$group": {"_id": "$mal_id", "avg": {"$avg": "$score"}, "count": {"$sum": 1}}},
+        ]
+        agg = await db.ratings.aggregate(pipeline).to_list(1)
+        avg = round(agg[0]["avg"], 2) if agg else 0.0
+        count = agg[0]["count"] if agg else 0
+    else:
+        scores = [r.get("score") for r in ratings_data if r.get("score")]
+        avg = round(sum(scores) / len(scores), 2) if scores else 0.0
+        count = len(scores)
 
     my_rating = None
     if authorization:
         try:
             user = await get_current_user(authorization)
-            mine = await db.ratings.find_one({"mal_id": mal_id, "user_id": user.id})
+            mine = None
+            if SUPABASE_SERVICE:
+                try:
+                    result = await asyncio.to_thread(lambda: SUPABASE_SERVICE.table('ratings')
+                        .select('score')
+                        .eq('mal_id', mal_id)
+                        .eq('user_id', user.id)
+                        .single()
+                        .execute())
+                    mine = result.data if result and hasattr(result, 'data') else None
+                except Exception:
+                    mine = await db.ratings.find_one({"mal_id": mal_id, "user_id": user.id})
+            else:
+                mine = await db.ratings.find_one({"mal_id": mal_id, "user_id": user.id})
             my_rating = mine["score"] if mine else None
         except HTTPException:
             pass
@@ -617,16 +664,48 @@ async def get_rating(mal_id: int, authorization: Optional[str] = Header(None)):
 
 
 async def _rating_stats(mal_id: int, user_id: Optional[str]) -> RatingStats:
-    pipeline = [
-        {"$match": {"mal_id": mal_id}},
-        {"$group": {"_id": "$mal_id", "avg": {"$avg": "$score"}, "count": {"$sum": 1}}},
-    ]
-    agg = await db.ratings.aggregate(pipeline).to_list(1)
-    avg = round(agg[0]["avg"], 2) if agg else 0.0
-    count = agg[0]["count"] if agg else 0
+    # Try Supabase first
+    ratings_data = []
+    if SUPABASE_SERVICE:
+        try:
+            result = await asyncio.to_thread(lambda: SUPABASE_SERVICE.table('ratings')
+                .select('score')
+                .eq('mal_id', mal_id)
+                .execute())
+            ratings_data = result.data if result and hasattr(result, 'data') else []
+        except Exception as e:
+            logger.info(f"Supabase ratings read failed in _rating_stats: {e}")
+    
+    # Fallback to file-backed storage
+    if not ratings_data:
+        pipeline = [
+            {"$match": {"mal_id": mal_id}},
+            {"$group": {"_id": "$mal_id", "avg": {"$avg": "$score"}, "count": {"$sum": 1}}},
+        ]
+        agg = await db.ratings.aggregate(pipeline).to_list(1)
+        avg = round(agg[0]["avg"], 2) if agg else 0.0
+        count = agg[0]["count"] if agg else 0
+    else:
+        scores = [r.get("score") for r in ratings_data if r.get("score")]
+        avg = round(sum(scores) / len(scores), 2) if scores else 0.0
+        count = len(scores)
+    
     my_rating = None
     if user_id:
-        mine = await db.ratings.find_one({"mal_id": mal_id, "user_id": user_id})
+        mine = None
+        if SUPABASE_SERVICE:
+            try:
+                result = await asyncio.to_thread(lambda: SUPABASE_SERVICE.table('ratings')
+                    .select('score')
+                    .eq('mal_id', mal_id)
+                    .eq('user_id', user_id)
+                    .single()
+                    .execute())
+                mine = result.data if result and hasattr(result, 'data') else None
+            except Exception:
+                mine = await db.ratings.find_one({"mal_id": mal_id, "user_id": user_id})
+        else:
+            mine = await db.ratings.find_one({"mal_id": mal_id, "user_id": user_id})
         my_rating = mine["score"] if mine else None
     return RatingStats(avg=avg, count=count, my_rating=my_rating)
 
@@ -634,13 +713,26 @@ async def _rating_stats(mal_id: int, user_id: Optional[str]) -> RatingStats:
 @api_router.post("/ratings/{mal_id}", response_model=RatingStats)
 async def upsert_rating(mal_id: int, payload: RatingIn,
                         user: AuthedUser = Depends(require_active)):
+    rating_id = str(uuid.uuid4())
     await db.ratings.update_one(
         {"user_id": user.id, "mal_id": mal_id},
         {"$set": {"score": payload.score, "updated_at": datetime.utcnow()},
-         "$setOnInsert": {"id": str(uuid.uuid4()), "created_at": datetime.utcnow(),
+         "$setOnInsert": {"id": rating_id, "created_at": datetime.utcnow(),
                           "user_id": user.id, "mal_id": mal_id}},
         upsert=True,
     )
+    # Mirror to Supabase (blocking to ensure persistence)
+    if SUPABASE_SERVICE:
+        try:
+            await asyncio.to_thread(lambda: SUPABASE_SERVICE.table('ratings').upsert({
+                'id': rating_id,
+                'user_id': user.id,
+                'mal_id': mal_id,
+                'score': payload.score,
+                'updated_at': datetime.utcnow().isoformat(),
+            }).execute())
+        except Exception as e:
+            logger.exception(f"Supabase mirror upsert failed: {e}")
     return await _rating_stats(mal_id, user.id)
 
 
@@ -1572,16 +1664,16 @@ async def report_stream(payload: ReportIn, user: AuthedUser = Depends(get_curren
     # Mirror to Supabase reports table if service client exists
     if SUPABASE_SERVICE:
         try:
-            asyncio.create_task(asyncio.to_thread(lambda: SUPABASE_SERVICE.table('reports').insert({
+            await asyncio.to_thread(lambda: SUPABASE_SERVICE.table('reports').insert({
                 'id': doc['id'], 'mal_id': doc['mal_id'], 'episode': doc['episode'],
                 'lang': doc['lang'], 'source': doc['source'], 'anikoto_id': doc.get('anikoto_id'),
                 'reported_url': doc.get('reported_url'), 'server_url': doc.get('server_url'),
                 'probe_ok': doc.get('probe_ok'), 'notes': doc.get('notes'),
                 'user_id': doc.get('user_id'), 'user_name': doc.get('user_name'),
                 'created_at': doc['created_at'].isoformat(),
-            }).execute()))
-        except Exception:
-            logger.exception("Supabase mirror insert failed for report")
+            }).execute())
+        except Exception as e:
+            logger.exception(f"Supabase mirror insert failed for report: {e}")
 
     return ReportOut(**doc)
 
@@ -1696,14 +1788,15 @@ class ProgressIn(BaseModel):
 @api_router.post("/progress")
 async def save_progress(payload: ProgressIn,
                         user: AuthedUser = Depends(require_active)):
+    progress_id = str(uuid.uuid4())
     payload_dict = payload.dict()
     await db.progress.update_one(
         {"user_id": user.id, "mal_id": payload.mal_id, "episode": payload.episode},
         {"$set": {**payload_dict, "user_id": user.id, "updated_at": datetime.utcnow()},
-         "$setOnInsert": {"id": str(uuid.uuid4()), "created_at": datetime.utcnow()}},
+         "$setOnInsert": {"id": progress_id, "created_at": datetime.utcnow()}},
         upsert=True,
     )
-    # Mirror progress to Supabase (upsert)
+    # Mirror progress to Supabase (blocking to ensure persistence)
     if SUPABASE_SERVICE:
         try:
             sup_row = {
@@ -1718,15 +1811,32 @@ async def save_progress(payload: ProgressIn,
                 'image_url': payload.image_url,
                 'updated_at': datetime.utcnow().isoformat(),
             }
-            asyncio.create_task(asyncio.to_thread(lambda: SUPABASE_SERVICE.table('progress').upsert(sup_row).execute()))
-        except Exception:
-            logger.exception("Supabase mirror progress failed")
+            await asyncio.to_thread(lambda: SUPABASE_SERVICE.table('progress').upsert(sup_row).execute())
+        except Exception as e:
+            logger.exception(f"Supabase mirror progress failed: {e}")
     return {"ok": True}
 
 
 @api_router.get("/progress/me")
 async def my_progress(user: AuthedUser = Depends(get_current_user), limit: int = 20):
-    rows = await db.progress.find({"user_id": user.id}, sort=[("updated_at", -1)], limit=limit)
+    # Try Supabase first
+    rows = []
+    if SUPABASE_SERVICE:
+        try:
+            result = await asyncio.to_thread(lambda: SUPABASE_SERVICE.table('progress')
+                .select('*')
+                .eq('user_id', user.id)
+                .order('updated_at', desc=True)
+                .limit(limit)
+                .execute())
+            rows = result.data if result and hasattr(result, 'data') else []
+        except Exception as e:
+            logger.info(f"Supabase progress read failed, falling back to file-backed: {e}")
+    
+    # Fallback to file-backed storage
+    if not rows:
+        rows = await db.progress.find({"user_id": user.id}, sort=[("updated_at", -1)], limit=limit)
+    
     out = []
     for r in rows:
         out.append({
@@ -1756,6 +1866,27 @@ async def security_headers_middleware(request: Request, call_next):
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
     return response
+
+
+@api_router.get("/health")
+async def health():
+    """Health check endpoint. Returns Supabase connectivity state and basic DB counts."""
+    ok = True
+    details = {"supabase": False}
+    if SUPABASE_SERVICE:
+        try:
+            # simple call to verify service role key works
+            res = await asyncio.to_thread(lambda: SUPABASE_SERVICE.rpc('pg_isready').execute() if hasattr(SUPABASE_SERVICE, 'rpc') else SUPABASE_SERVICE.table('comments').select('id').limit(1).execute())
+            details['supabase'] = True
+        except Exception as e:
+            details['supabase'] = False
+            details['error'] = str(e)
+            ok = False
+    else:
+        details['supabase'] = False
+        ok = False
+
+    return {"ok": ok, "details": details}
 
 
 # ---------------------------------------------------------------------------
