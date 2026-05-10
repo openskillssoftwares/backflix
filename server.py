@@ -515,35 +515,60 @@ async def is_anime_blocked(mal_id: int):
 # ---------------------------------------------------------------------------
 @api_router.get("/comments/{mal_id}", response_model=List[CommentOut])
 async def list_comments(mal_id: int):
-    # Read comments from Supabase only. Do NOT fall back to file-backed storage.
-    rows = []
-    if not SUPABASE_SERVICE:
-        logger.warning("Supabase service not configured; returning empty comments list")
-        return []
+    rows = await _load_comment_rows(mal_id=mal_id, include_deleted=False, limit=200)
+    return [CommentOut(**_normalize_comment_row(r)) for r in rows]
 
-    try:
-        result = await asyncio.to_thread(lambda: SUPABASE_SERVICE.table('comments')
-            .select('*')
-            .eq('mal_id', mal_id)
-            .neq('approved', False)
-            .neq('deleted', True)
-            .order('created_at', desc=True)
-            .limit(200)
-            .execute())
-        rows = result.data if result and hasattr(result, 'data') else []
-    except Exception as e:
-        logger.exception(f"Supabase read for comments failed: {e}")
-        # Do not fall back to file-backed storage per request; return empty list
-        return []
 
-    return [CommentOut(**{
-        "id": r["id"], "mal_id": r["mal_id"], "user_id": r["user_id"],
-        "user_name": r.get("user_name", "anon"), "body": r["body"],
+def _normalize_comment_row(r: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": r["id"],
+        "mal_id": r["mal_id"],
+        "user_id": r["user_id"],
+        "user_name": r.get("user_name", "anon"),
+        "body": r["body"],
         "parent_id": r.get("parent_id"),
         "created_at": r.get("created_at"),
         "edited_at": r.get("edited_at"),
         "approved": r.get("approved", True),
-    }) for r in rows]
+    }
+
+
+async def _load_comment_rows(
+    mal_id: Optional[int] = None,
+    include_deleted: bool = False,
+    limit: Optional[int] = 200,
+) -> List[Dict[str, Any]]:
+    merged: Dict[str, Dict[str, Any]] = {}
+
+    if SUPABASE_SERVICE:
+        try:
+            query = SUPABASE_SERVICE.table('comments').select('*')
+            if mal_id is not None:
+                query = query.eq('mal_id', mal_id)
+            if not include_deleted:
+                query = query.neq('approved', False).neq('deleted', True)
+            query = query.order('created_at', desc=True)
+            if limit is not None:
+                query = query.limit(limit)
+            result = await asyncio.to_thread(lambda: query.execute())
+            for row in (result.data or []):
+                merged[row['id']] = row
+        except Exception as e:
+            logger.info(f"Supabase read for comments failed: {e}")
+
+    local_query: Dict[str, Any] = {}
+    if mal_id is not None:
+        local_query['mal_id'] = mal_id
+    if not include_deleted:
+        local_query['approved'] = {"$ne": False}
+        local_query['deleted'] = {"$ne": True}
+    local_rows = await db.comments.find(local_query, sort=[("created_at", -1)], limit=limit)
+    for row in local_rows:
+        merged.setdefault(row['id'], row)
+
+    rows = list(merged.values())
+    rows.sort(key=lambda row: row.get('created_at') or datetime.min, reverse=True)
+    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -1034,14 +1059,14 @@ async def public_user_comments(user_id: str, limit: int = 30):
 # ---------------------------------------------------------------------------
 @api_router.get("/admin/stats")
 async def admin_stats(_: AuthedUser = Depends(require_admin)):
-    comments = await db.comments.count_documents({})
+    comments_rows = await _load_comment_rows(include_deleted=False, limit=None)
+    comments = len(comments_rows)
     ratings = await db.ratings.count_documents({})
     banned_users = await db.banned_users.count_documents({})
     banned_anime = await db.banned_anime.count_documents({})
     flagged = await db.security_log.count_documents({})
     # distinct users from comments/ratings
     user_ids = set()
-    comments_rows = await db.comments.find({}, limit=None)
     for r in comments_rows:
         user_ids.add(r.get("user_id"))
     ratings_rows = await db.ratings.find({}, limit=None)
@@ -1072,7 +1097,7 @@ async def admin_list_users(_: AuthedUser = Depends(require_admin)):
             "comments": seen.get(uid, {}).get("comments", 0),
             "ratings": seen.get(uid, {}).get("ratings", 0),
         }
-    comments_all = await db.comments.find({}, limit=None)
+    comments_all = await _load_comment_rows(include_deleted=False, limit=None)
     for r in comments_all:
         uid = r.get("user_id")
         if uid and uid not in seen:
@@ -1161,7 +1186,7 @@ async def admin_unban_anime(mal_id: int, _: AuthedUser = Depends(require_admin))
 
 @api_router.get("/admin/comments")
 async def admin_list_comments(_: AuthedUser = Depends(require_admin)):
-    rows = await db.comments.find({}, sort=[("created_at", -1)], limit=500)
+    rows = await _load_comment_rows(include_deleted=True, limit=500)
     return [{
         "id": r["id"], "mal_id": r["mal_id"], "user_id": r["user_id"],
         "user_name": r.get("user_name", ""), "body": r["body"],
@@ -1180,18 +1205,38 @@ async def admin_list_reports(_: AuthedUser = Depends(require_admin)):
 async def admin_approve_comment(comment_id: str, _: AuthedUser = Depends(require_admin)):
     await db.comments.update_one({"id": comment_id},
                                  {"$set": {"approved": True, "deleted": False}})
+    if SUPABASE_SERVICE:
+        try:
+            await asyncio.to_thread(lambda: SUPABASE_SERVICE.table('comments').update({
+                'approved': True,
+                'deleted': False,
+            }).eq('id', comment_id).execute())
+        except Exception as e:
+            logger.info(f"Supabase mirror approve failed: {e}")
     return {"ok": True}
 
 
 @api_router.delete("/admin/comments/{comment_id}")
 async def admin_delete_comment(comment_id: str, _: AuthedUser = Depends(require_admin)):
     await db.comments.update_one({"id": comment_id}, {"$set": {"deleted": True}})
+    if SUPABASE_SERVICE:
+        try:
+            await asyncio.to_thread(lambda: SUPABASE_SERVICE.table('comments').update({
+                'deleted': True,
+            }).eq('id', comment_id).execute())
+        except Exception as e:
+            logger.info(f"Supabase mirror delete failed: {e}")
     return {"ok": True}
 
 
 @api_router.delete("/admin/comments/{comment_id}/hard")
 async def admin_hard_delete_comment(comment_id: str, _: AuthedUser = Depends(require_admin)):
     await db.comments.delete_one({"id": comment_id})
+    if SUPABASE_SERVICE:
+        try:
+            await asyncio.to_thread(lambda: SUPABASE_SERVICE.table('comments').delete().eq('id', comment_id).execute())
+        except Exception as e:
+            logger.info(f"Supabase mirror hard delete failed: {e}")
     return {"ok": True}
 
 
