@@ -2059,9 +2059,18 @@ async def security_headers_middleware(request: Request, call_next):
 
 @api_router.get("/health")
 async def health():
-    """Health check endpoint. Returns Supabase connectivity state and basic DB counts."""
+    """Health check endpoint. Returns comment storage and Supabase mirror state."""
     ok = True
-    details = {"supabase": False}
+    details = {"supabase": False, "comments": False}
+
+    try:
+        await db.comments.find_one({})
+        details["comments"] = True
+    except Exception as e:
+        details["comments"] = False
+        details["error"] = str(e)
+        ok = False
+
     if SUPABASE_SERVICE:
         try:
             # simple call to verify service role key works
@@ -2070,10 +2079,12 @@ async def health():
         except Exception as e:
             details['supabase'] = False
             details['error'] = str(e)
-            ok = False
+            if not details["comments"]:
+                ok = False
     else:
         details['supabase'] = False
-        ok = False
+        if not details["comments"]:
+            ok = False
 
     return {"ok": ok, "details": details}
 
