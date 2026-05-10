@@ -520,6 +520,20 @@ async def list_comments(mal_id: int):
 
 
 def _normalize_comment_row(r: Dict[str, Any]) -> Dict[str, Any]:
+    created_at = r.get("created_at")
+    if isinstance(created_at, str):
+        try:
+            created_at = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        except Exception:
+            created_at = datetime.utcnow()
+
+    edited_at = r.get("edited_at")
+    if isinstance(edited_at, str):
+        try:
+            edited_at = datetime.fromisoformat(edited_at.replace("Z", "+00:00"))
+        except Exception:
+            edited_at = None
+
     return {
         "id": r["id"],
         "mal_id": r["mal_id"],
@@ -527,8 +541,8 @@ def _normalize_comment_row(r: Dict[str, Any]) -> Dict[str, Any]:
         "user_name": r.get("user_name", "anon"),
         "body": r["body"],
         "parent_id": r.get("parent_id"),
-        "created_at": r.get("created_at"),
-        "edited_at": r.get("edited_at"),
+        "created_at": created_at,
+        "edited_at": edited_at,
         "approved": r.get("approved", True),
     }
 
@@ -567,7 +581,19 @@ async def _load_comment_rows(
         merged.setdefault(row['id'], row)
 
     rows = list(merged.values())
-    rows.sort(key=lambda row: row.get('created_at') or datetime.min, reverse=True)
+
+    def _sort_key(row: Dict[str, Any]):
+        created_at = row.get('created_at')
+        if isinstance(created_at, str):
+            try:
+                created_at = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+            except Exception:
+                created_at = datetime.min
+        if not isinstance(created_at, datetime):
+            created_at = datetime.min
+        return created_at
+
+    rows.sort(key=_sort_key, reverse=True)
     return rows
 
 
