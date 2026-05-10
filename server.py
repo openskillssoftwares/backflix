@@ -237,6 +237,7 @@ anikoto_mal_index = AsyncCollection("anikoto_mal_index", DATA_DIR)
 notifications = AsyncCollection("notifications", DATA_DIR)
 profiles = AsyncCollection("profiles", DATA_DIR)
 reports = AsyncCollection("reports", DATA_DIR)
+discussions = AsyncCollection("discussions", DATA_DIR)
 
 # db shim matching previous attribute access
 class DBShim:
@@ -255,6 +256,7 @@ db.anikoto_mal_index = anikoto_mal_index
 db.notifications = notifications
 db.profiles = profiles
 db.reports = reports
+db.discussions = discussions
 
 
 
@@ -326,6 +328,29 @@ class ReportOut(BaseModel):
     user_id: Optional[str] = None
     user_name: Optional[str] = None
     probe_ok: Optional[bool] = None
+
+
+class DiscussionIn(BaseModel):
+    scope: Annotated[str, Field(min_length=3, max_length=16)] = "general"
+    mal_id: Optional[int] = None
+    title: Optional[Annotated[str, Field(min_length=3, max_length=140)]] = None
+    body: Annotated[str, Field(min_length=1, max_length=4000)]
+    parent_id: Optional[str] = None
+
+
+class DiscussionOut(BaseModel):
+    id: str
+    scope: str
+    mal_id: Optional[int] = None
+    root_id: str
+    parent_id: Optional[str] = None
+    title: Optional[str] = None
+    body: str
+    user_id: str
+    user_name: str
+    created_at: datetime
+    edited_at: Optional[datetime] = None
+    reply_count: int = 0
 
 
 class AuthedUser(BaseModel):
@@ -519,6 +544,99 @@ async def list_comments(mal_id: int):
         "edited_at": r.get("edited_at"),
         "approved": r.get("approved", True),
     }) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Community discussions
+# ---------------------------------------------------------------------------
+@api_router.get("/discussions", response_model=List[DiscussionOut])
+async def list_discussions(scope: str = "general", mal_id: Optional[int] = None, limit: int = 100):
+    query: Dict[str, Any] = {"scope": scope}
+    if scope == "anime" and mal_id is not None:
+        query["mal_id"] = mal_id
+    rows = await db.discussions.find(query, sort=[("created_at", -1)], limit=limit)
+    reply_counts: Dict[str, int] = {}
+    for row in rows:
+        parent_id = row.get("parent_id")
+        if parent_id:
+          root_id = row.get("root_id") or parent_id
+          reply_counts[root_id] = reply_counts.get(root_id, 0) + 1
+
+    return [DiscussionOut(**{
+        "id": row["id"],
+        "scope": row.get("scope", "general"),
+        "mal_id": row.get("mal_id"),
+        "root_id": row.get("root_id") or row["id"],
+        "parent_id": row.get("parent_id"),
+        "title": row.get("title"),
+        "body": row["body"],
+        "user_id": row["user_id"],
+        "user_name": row.get("user_name", "anon"),
+        "created_at": row["created_at"],
+        "edited_at": row.get("edited_at"),
+        "reply_count": reply_counts.get(row.get("root_id") or row["id"], 0),
+    }) for row in rows]
+
+
+@api_router.post("/discussions", response_model=DiscussionOut)
+async def create_discussion(payload: DiscussionIn, user: AuthedUser = Depends(require_active)):
+    scope = payload.scope.lower().strip() or "general"
+    if scope not in {"general", "anime"}:
+        raise HTTPException(status_code=400, detail="Invalid discussion scope")
+    if scope == "anime" and not payload.mal_id:
+        raise HTTPException(status_code=400, detail="Anime discussions require mal_id")
+
+    parent = None
+    if payload.parent_id:
+        parent = await db.discussions.find_one({"id": payload.parent_id})
+        if not parent:
+            raise HTTPException(status_code=404, detail="Parent discussion not found")
+        if parent.get("scope") != scope or parent.get("mal_id") != payload.mal_id:
+            raise HTTPException(status_code=400, detail="Reply scope mismatch")
+
+    now = datetime.utcnow()
+    doc = {
+        "id": str(uuid.uuid4()),
+        "scope": scope,
+        "mal_id": payload.mal_id if scope == "anime" else None,
+        "root_id": parent.get("root_id") if parent else "",
+        "parent_id": payload.parent_id,
+        "title": payload.title.strip() if payload.title and not payload.parent_id else (parent.get("title") if parent else None),
+        "body": payload.body.strip(),
+        "user_id": user.id,
+        "user_name": user.name,
+        "created_at": now,
+        "edited_at": None,
+    }
+    if not doc["title"] and not payload.parent_id:
+        raise HTTPException(status_code=400, detail="Discussion title is required")
+    if not payload.parent_id:
+        doc["root_id"] = doc["id"]
+
+    await db.discussions.insert_one(doc)
+
+    if SUPABASE_SERVICE:
+        try:
+            await asyncio.to_thread(lambda: SUPABASE_SERVICE.table('discussions').insert({
+                'id': doc['id'],
+                'scope': doc['scope'],
+                'mal_id': doc.get('mal_id'),
+                'root_id': doc['root_id'],
+                'parent_id': doc.get('parent_id'),
+                'title': doc.get('title'),
+                'body': doc['body'],
+                'user_id': doc['user_id'],
+                'user_name': doc['user_name'],
+                'created_at': doc['created_at'].isoformat(),
+                'edited_at': None,
+            }).execute())
+        except Exception as e:
+            logger.info(f"Supabase mirror insert failed for discussion: {e}")
+
+    return DiscussionOut(**{
+        **doc,
+        "reply_count": 0,
+    })
 
 
 @api_router.post("/comments/{mal_id}", response_model=CommentOut)
