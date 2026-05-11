@@ -21,6 +21,7 @@ import logging
 import asyncio
 import importlib
 from pathlib import Path
+from urllib.parse import quote_plus
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any, Annotated
 import uuid
@@ -238,6 +239,7 @@ notifications = AsyncCollection("notifications", DATA_DIR)
 profiles = AsyncCollection("profiles", DATA_DIR)
 reports = AsyncCollection("reports", DATA_DIR)
 discussions = AsyncCollection("discussions", DATA_DIR)
+rooms = AsyncCollection("rooms", DATA_DIR)
 
 # db shim matching previous attribute access
 class DBShim:
@@ -257,6 +259,7 @@ db.notifications = notifications
 db.profiles = profiles
 db.reports = reports
 db.discussions = discussions
+db.rooms = rooms
 
 
 
@@ -273,11 +276,13 @@ class CommentOut(BaseModel):
     mal_id: int
     user_id: str
     user_name: str
+    avatar_url: Optional[str] = None
     body: str
     parent_id: Optional[str] = None
     created_at: datetime
     edited_at: Optional[datetime] = None
     approved: bool = True
+    deleted: bool = False
 
 
 class RatingIn(BaseModel):
@@ -348,9 +353,31 @@ class DiscussionOut(BaseModel):
     body: str
     user_id: str
     user_name: str
+    avatar_url: Optional[str] = None
     created_at: datetime
     edited_at: Optional[datetime] = None
+    deleted: bool = False
     reply_count: int = 0
+
+
+class RoomIn(BaseModel):
+    title: Annotated[str, Field(min_length=1, max_length=120)]
+    mal_id: Optional[int] = None
+    episode: int = 1
+
+
+class RoomOut(BaseModel):
+    id: str
+    code: str
+    title: str
+    mal_id: Optional[int] = None
+    episode: int = 1
+    host_id: str
+    host_name: str
+    host_avatar_url: Optional[str] = None
+    member_count: int = 1
+    created_at: datetime
+    updated_at: Optional[datetime] = None
 
 
 class AuthedUser(BaseModel):
@@ -516,7 +543,7 @@ async def is_anime_blocked(mal_id: int):
 @api_router.get("/comments/{mal_id}", response_model=List[CommentOut])
 async def list_comments(mal_id: int):
     rows = await _load_comment_rows(mal_id=mal_id, include_deleted=False, limit=200)
-    return [CommentOut(**_normalize_comment_row(r)) for r in rows]
+    return [CommentOut(**await _serialize_comment_out(_normalize_comment_row(r))) for r in rows]
 
 
 def _normalize_comment_row(r: Dict[str, Any]) -> Dict[str, Any]:
@@ -613,20 +640,7 @@ async def list_discussions(scope: str = "general", mal_id: Optional[int] = None,
           root_id = row.get("root_id") or parent_id
           reply_counts[root_id] = reply_counts.get(root_id, 0) + 1
 
-    return [DiscussionOut(**{
-        "id": row["id"],
-        "scope": row.get("scope", "general"),
-        "mal_id": row.get("mal_id"),
-        "root_id": row.get("root_id") or row["id"],
-        "parent_id": row.get("parent_id"),
-        "title": row.get("title"),
-        "body": row["body"],
-        "user_id": row["user_id"],
-        "user_name": row.get("user_name", "anon"),
-        "created_at": row["created_at"],
-        "edited_at": row.get("edited_at"),
-        "reply_count": reply_counts.get(row.get("root_id") or row["id"], 0),
-    }) for row in rows]
+    return [DiscussionOut(**await _serialize_discussion_out(row, reply_counts.get(row.get("root_id") or row["id"], 0))) for row in rows]
 
 
 @api_router.post("/discussions", response_model=DiscussionOut)
@@ -655,9 +669,10 @@ async def create_discussion(payload: DiscussionIn, user: AuthedUser = Depends(re
         "title": payload.title.strip() if payload.title and not payload.parent_id else (parent.get("title") if parent else None),
         "body": payload.body.strip(),
         "user_id": user.id,
-        "user_name": user.name,
+        "user_name": await _resolve_display_name(user.id, user.name),
         "created_at": now,
         "edited_at": None,
+        "deleted": False,
     }
     if not doc["title"] and not payload.parent_id:
         raise HTTPException(status_code=400, detail="Discussion title is required")
@@ -684,10 +699,21 @@ async def create_discussion(payload: DiscussionIn, user: AuthedUser = Depends(re
         except Exception as e:
             logger.info(f"Supabase mirror insert failed for discussion: {e}")
 
-    return DiscussionOut(**{
-        **doc,
-        "reply_count": 0,
-    })
+    return DiscussionOut(**doc)
+
+
+@api_router.delete("/discussions/{discussion_id}")
+async def delete_discussion(discussion_id: str, user: AuthedUser = Depends(get_current_user)):
+    row = await db.discussions.find_one({"id": discussion_id})
+    if not row:
+        raise HTTPException(status_code=404, detail="Not found")
+    if row.get("user_id") != user.id and not user.is_admin:
+        raise HTTPException(status_code=403, detail="Not allowed")
+    await db.discussions.update_one(
+        {"id": discussion_id},
+        {"$set": {"deleted": True, "edited_at": datetime.utcnow()}},
+    )
+    return {"ok": True}
 
 
 @api_router.post("/comments/{mal_id}", response_model=CommentOut)
@@ -697,7 +723,7 @@ async def create_comment(mal_id: int, payload: CommentIn, request: Request,
         "id": str(uuid.uuid4()),
         "mal_id": mal_id,
         "user_id": user.id,
-        "user_name": user.name,
+    "user_name": await _resolve_display_name(user.id, user.name),
         "body": payload.body,
         "parent_id": payload.parent_id,
         "created_at": datetime.utcnow(),
@@ -722,7 +748,7 @@ async def create_comment(mal_id: int, payload: CommentIn, request: Request,
             }).execute())
         except Exception as e:
             logger.exception(f"Supabase mirror insert failed: {e}")
-    return CommentOut(**doc)
+    return CommentOut(**await _serialize_comment_out(doc))
 
 
 @api_router.put("/comments/{comment_id}")
@@ -745,17 +771,7 @@ async def edit_comment(comment_id: str, payload: CommentIn, request: Request,
             }).eq('id', comment_id).execute())
         except Exception as e:
             logger.exception(f"Supabase mirror update failed: {e}")
-    return CommentOut(**{
-        "id": updated["id"],
-        "mal_id": updated["mal_id"],
-        "user_id": updated["user_id"],
-        "user_name": updated.get("user_name", "anon"),
-        "body": updated["body"],
-        "parent_id": updated.get("parent_id"),
-        "created_at": updated.get("created_at"),
-        "edited_at": updated.get("edited_at"),
-        "approved": updated.get("approved", True),
-    })
+    return CommentOut(**await _serialize_comment_out(updated))
 
 
 @api_router.delete("/comments/{comment_id}")
@@ -922,6 +938,7 @@ class PublicProfileOut(BaseModel):
     user_name: str
     is_admin: bool
     joined_at: Optional[str] = None
+    avatar_url: Optional[str] = None
     counts: Dict[str, int]
 
 
@@ -958,6 +975,96 @@ async def _resolve_user_name(user_id: str) -> Optional[str]:
     return None
 
 
+async def _resolve_display_name(user_id: str, fallback: Optional[str] = None) -> str:
+    """Prefer profile names, then activity-derived names, then the fallback."""
+    if fallback and fallback.strip() and fallback.strip().lower() != "anon":
+        return fallback.strip()
+
+    if SUPABASE_SERVICE is not None:
+        try:
+            sup_res = SUPABASE_SERVICE.table('profiles').select('display_name,mal_username,avatar_url').eq('user_id', user_id).maybe_single().execute()
+            data = None
+            try:
+                data = getattr(sup_res, 'data', None) or (sup_res.get('data') if isinstance(sup_res, dict) else None)
+            except Exception:
+                data = None
+            if data:
+                profile_name = data.get('display_name') or data.get('mal_username')
+                if profile_name:
+                    return profile_name
+        except Exception:
+            logger.exception("Supabase profile lookup failed")
+
+    profile = await db.profiles.find_one({"user_id": user_id})
+    if profile:
+        profile_name = profile.get("display_name") or profile.get("mal_username")
+        if profile_name:
+            return profile_name
+
+    stored = await _resolve_user_name(user_id)
+    return stored or fallback or "anon"
+
+
+def _default_avatar_url(user_id: str) -> str:
+    return f"https://api.dicebear.com/9.x/notionists-neutral/svg?seed={quote_plus(user_id)}"
+
+
+async def _resolve_avatar_url(user_id: str) -> str:
+    if SUPABASE_SERVICE is not None:
+        try:
+            sup_res = SUPABASE_SERVICE.table('profiles').select('avatar_url').eq('user_id', user_id).maybe_single().execute()
+            data = None
+            try:
+                data = getattr(sup_res, 'data', None) or (sup_res.get('data') if isinstance(sup_res, dict) else None)
+            except Exception:
+                data = None
+            avatar = (data or {}).get('avatar_url') if data else None
+            if avatar:
+                return avatar
+        except Exception:
+            logger.exception("Supabase avatar lookup failed")
+
+    profile = await db.profiles.find_one({"user_id": user_id})
+    if profile and profile.get("avatar_url"):
+        return profile["avatar_url"]
+    return _default_avatar_url(user_id)
+
+
+async def _serialize_comment_out(row: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": row["id"],
+        "mal_id": row["mal_id"],
+        "user_id": row["user_id"],
+        "user_name": await _resolve_display_name(row["user_id"], row.get("user_name")),
+        "avatar_url": await _resolve_avatar_url(row["user_id"]),
+        "body": row["body"],
+        "parent_id": row.get("parent_id"),
+        "created_at": row["created_at"],
+        "edited_at": row.get("edited_at"),
+        "approved": row.get("approved", True),
+        "deleted": row.get("deleted", False),
+    }
+
+
+async def _serialize_discussion_out(row: Dict[str, Any], reply_count: int = 0) -> Dict[str, Any]:
+    return {
+        "id": row["id"],
+        "scope": row.get("scope", "general"),
+        "mal_id": row.get("mal_id"),
+        "root_id": row.get("root_id") or row["id"],
+        "parent_id": row.get("parent_id"),
+        "title": row.get("title"),
+        "body": row.get("body", ""),
+        "user_id": row["user_id"],
+        "user_name": await _resolve_display_name(row["user_id"], row.get("user_name")),
+        "avatar_url": await _resolve_avatar_url(row["user_id"]),
+        "created_at": row["created_at"],
+        "edited_at": row.get("edited_at"),
+        "deleted": row.get("deleted", False),
+        "reply_count": reply_count,
+    }
+
+
 async def _progress_unique_count(user_id: str) -> int:
     rows = await db.progress.find({"user_id": user_id}, limit=None)
     return len({r.get("mal_id") for r in rows if r.get("mal_id") is not None})
@@ -978,7 +1085,7 @@ async def public_profile(user_id: str):
             except Exception:
                 data = None
             if data:
-                profile = {'user_id': user_id, 'display_name': data.get('display_name'), 'mal_username': data.get('mal_username')}
+                profile = {'user_id': user_id, 'display_name': data.get('display_name'), 'mal_username': data.get('mal_username'), 'avatar_url': data.get('avatar_url')}
         except Exception:
             logger.exception("Supabase profile lookup failed")
 
@@ -1010,8 +1117,82 @@ async def public_profile(user_id: str):
         user_name=name or (profile or {}).get("mal_username") or "anon",
         is_admin=False,
         joined_at=first_ts.isoformat() if first_ts else None,
+        avatar_url=(profile or {}).get("avatar_url") or await _resolve_avatar_url(user_id),
         counts={"comments": comments, "ratings": ratings, "progress": progress},
     )
+
+
+def _room_code() -> str:
+    return uuid.uuid4().hex[:8].upper()
+
+
+async def _serialize_room_out(row: Dict[str, Any]) -> RoomOut:
+    return RoomOut(
+        id=row["id"],
+        code=row["code"],
+        title=row["title"],
+        mal_id=row.get("mal_id"),
+        episode=int(row.get("episode", 1)),
+        host_id=row["host_id"],
+        host_name=await _resolve_display_name(row["host_id"], row.get("host_name")),
+        host_avatar_url=await _resolve_avatar_url(row["host_id"]),
+        member_count=int(row.get("member_count", 1)),
+        created_at=row["created_at"],
+        updated_at=row.get("updated_at"),
+    )
+
+
+@api_router.get("/rooms", response_model=List[RoomOut])
+async def list_rooms(limit: int = 20):
+    limit = max(1, min(50, limit))
+    rows = await db.rooms.find({}, sort=[("updated_at", -1), ("created_at", -1)], limit=limit)
+    return [await _serialize_room_out(row) for row in rows]
+
+
+@api_router.post("/rooms", response_model=RoomOut)
+async def create_room(payload: RoomIn, user: AuthedUser = Depends(get_current_user)):
+    room_id = str(uuid.uuid4())
+    code = _room_code()
+    now = datetime.utcnow()
+    doc = {
+        "id": room_id,
+        "code": code,
+        "title": payload.title.strip(),
+        "mal_id": payload.mal_id,
+        "episode": max(1, payload.episode),
+        "host_id": user.id,
+        "host_name": user.name,
+        "member_count": 1,
+        "created_at": now,
+        "updated_at": now,
+    }
+    await db.rooms.insert_one(doc)
+    return await _serialize_room_out(doc)
+
+
+@api_router.get("/rooms/{code}", response_model=RoomOut)
+async def get_room(code: str):
+    row = await db.rooms.find_one({"code": code.upper()})
+    if not row:
+        raise HTTPException(status_code=404, detail="Room not found")
+    return await _serialize_room_out(row)
+
+
+@api_router.post("/rooms/{code}/join", response_model=RoomOut)
+async def join_room(code: str, user: AuthedUser = Depends(get_current_user)):
+    row = await db.rooms.find_one({"code": code.upper()})
+    if not row:
+        raise HTTPException(status_code=404, detail="Room not found")
+    member_count = int(row.get("member_count", 1)) + 1
+    now = datetime.utcnow()
+    await db.rooms.update_one(
+        {"code": code.upper()},
+        {"$set": {"member_count": member_count, "updated_at": now, "last_joined_by": user.id}},
+        upsert=False,
+    )
+    row["member_count"] = member_count
+    row["updated_at"] = now
+    return await _serialize_room_out(row)
 
 
 @api_router.get("/users/{user_id}/ratings", response_model=List[PublicRatingOut])
@@ -1071,13 +1252,7 @@ async def public_user_comments(user_id: str, limit: int = 30):
         sort=[("created_at", -1)],
         limit=limit,
     )
-    return [CommentOut(**{
-        "id": r["id"], "mal_id": r["mal_id"], "user_id": r["user_id"],
-        "user_name": r.get("user_name", "anon"), "body": r["body"],
-        "parent_id": r.get("parent_id"),
-        "created_at": r["created_at"], "approved": r.get("approved", True),
-        "edited_at": r.get("edited_at"),
-    }) for r in rows]
+    return [CommentOut(**await _serialize_comment_out(_normalize_comment_row(r))) for r in rows]
 
 
 # ---------------------------------------------------------------------------
@@ -1213,12 +1388,7 @@ async def admin_unban_anime(mal_id: int, _: AuthedUser = Depends(require_admin))
 @api_router.get("/admin/comments")
 async def admin_list_comments(_: AuthedUser = Depends(require_admin)):
     rows = await _load_comment_rows(include_deleted=True, limit=500)
-    return [{
-        "id": r["id"], "mal_id": r["mal_id"], "user_id": r["user_id"],
-        "user_name": r.get("user_name", ""), "body": r["body"],
-        "created_at": r["created_at"], "approved": r.get("approved", True),
-        "deleted": r.get("deleted", False),
-    } for r in rows]
+    return [await _serialize_comment_out(_normalize_comment_row(r)) for r in rows]
 
 
 @api_router.get("/admin/reports")
@@ -1797,13 +1967,17 @@ async def get_stream(mal_id: int, ep: int = 1, lang: str = "sub",
         url = f"{MEGAPLAY_BASE}/stream/mal/{mal_id}/{ep}/{lang}"
         if await _probe_stream_url(url):
             return StreamOut(embed_url=url, source="mal", mal_id=mal_id, episode=ep, lang=lang)
+        
+        # MAL probe failed, try Anikoto fallback
         try:
             resolved = await anikoto_resolve(mal_id)
             aid = resolved.get("anikoto_id") if isinstance(resolved, dict) else None
             if aid:
                 return await _build_anikoto_stream(mal_id, ep, lang, int(aid))
-        except Exception:
-            logger.exception("Stream fallback resolution failed for mal_id=%s ep=%s", mal_id, ep)
+        except Exception as e:
+            logger.info(f"Anikoto fallback failed for mal_id={mal_id} ep={ep}: {e}")
+        
+        # Both failed, return MAL URL anyway (browser will show proper error)
         return StreamOut(embed_url=url, source="mal", mal_id=mal_id, episode=ep, lang=lang)
 
     if source == "anikoto":
