@@ -13,7 +13,7 @@ Storage: MongoDB collections
 - banned_users   : list of banned supabase user_ids
 - banned_anime   : list of banned mal_ids (cannot be streamed)
 """
-from fastapi import FastAPI, APIRouter, HTTPException, Header, Depends, Request
+from fastapi import FastAPI, APIRouter, HTTPException, Header, Depends, Request, WebSocket, WebSocketDisconnect
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 import os
@@ -23,7 +23,7 @@ import importlib
 from pathlib import Path
 from urllib.parse import quote_plus
 from pydantic import BaseModel, Field
-from typing import List, Optional, Dict, Any, Annotated
+from typing import List, Optional, Dict, Any, Annotated, Set
 import uuid
 from datetime import datetime
 import httpx
@@ -35,6 +35,9 @@ except Exception:  # pragma: no cover - optional dependency in local analysis
 
 # In-memory fallback cache used when MongoDB is not available (development)
 IN_MEMORY_CACHE: Dict[str, Dict[str, Any]] = {}
+
+# Active WebSocket connections: room_code -> set of connections
+ACTIVE_CONNECTIONS: Dict[str, Set[WebSocket]] = {}
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -63,6 +66,35 @@ if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY and _create_supabase_client is not
 
 app = FastAPI(title="Lumen API")
 api_router = APIRouter(prefix="/api")
+
+
+# WebSocket endpoint for real-time room communication
+@app.websocket("/ws/rooms/{code}")
+async def websocket_endpoint(websocket: WebSocket, code: str):
+    await websocket.accept()
+    room_key = code.strip().upper()
+    if room_key not in ACTIVE_CONNECTIONS:
+        ACTIVE_CONNECTIONS[room_key] = set()
+    ACTIVE_CONNECTIONS[room_key].add(websocket)
+    try:
+        while True:
+            message = await websocket.receive_text()
+            # Broadcast the message to all other clients in the same room
+            stale_clients: List[WebSocket] = []
+            for client in ACTIVE_CONNECTIONS.get(room_key, set()):
+                if client != websocket:
+                    try:
+                        await client.send_text(message)
+                    except Exception:
+                        stale_clients.append(client)
+            for stale in stale_clients:
+                ACTIVE_CONNECTIONS.get(room_key, set()).discard(stale)
+    except WebSocketDisconnect:
+        pass
+    finally:
+        ACTIVE_CONNECTIONS.get(room_key, set()).discard(websocket)
+        if room_key in ACTIVE_CONNECTIONS and not ACTIVE_CONNECTIONS[room_key]:
+            del ACTIVE_CONNECTIONS[room_key]
 
 
 # ---------------------------------------------------------------------------
@@ -371,7 +403,8 @@ class RoomOut(BaseModel):
     code: str
     title: str
     mal_id: Optional[int] = None
-    episode: int = 1
+    episode: int
+    has_uncensored_version: bool = False
     host_id: str
     host_name: str
     host_avatar_url: Optional[str] = None
@@ -1133,6 +1166,7 @@ async def _serialize_room_out(row: Dict[str, Any]) -> RoomOut:
         title=row["title"],
         mal_id=row.get("mal_id"),
         episode=int(row.get("episode", 1)),
+        has_uncensored_version=row.get("has_uncensored_version", False),
         host_id=row["host_id"],
         host_name=await _resolve_display_name(row["host_id"], row.get("host_name")),
         host_avatar_url=await _resolve_avatar_url(row["host_id"]),
@@ -1538,6 +1572,34 @@ def _anilist_to_jikan_anime(m: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     }
 
 
+_MAL_GENRE_NAME_BY_ID = {
+    1: "Action",
+    2: "Adventure",
+    4: "Comedy",
+    8: "Drama",
+    10: "Fantasy",
+    14: "Horror",
+    7: "Mystery",
+    22: "Romance",
+    24: "Sci-Fi",
+    36: "Slice of Life",
+    30: "Sports",
+    37: "Supernatural",
+    41: "Suspense",
+    27: "Shounen",
+    25: "Shoujo",
+    42: "Seinen",
+    43: "Josei",
+    18: "Mecha",
+    38: "Military",
+    19: "Music",
+    40: "Psychological",
+    17: "Martial Arts",
+    23: "School",
+    62: "Isekai",
+}
+
+
 async def _anilist_query(query: str, variables: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     try:
         async with httpx.AsyncClient(timeout=15.0) as http:
@@ -1619,11 +1681,31 @@ async def _anilist_for_jikan_path(path: str, request: Request) -> Optional[Dict[
                 media = (((res.get("data") or {}).get("Page") or {}).get("media") or [])
                 return {"data": [m for m in (_anilist_to_jikan_anime(x) for x in media) if m]}
         elif qp.get("genres"):
-            try:
-                # genres param is mal_id ints in Jikan; AniList uses names. Bail.
-                pass
-            except Exception:
-                pass
+            genre_ids = []
+            for raw_id in str(qp.get("genres") or "").split(","):
+                try:
+                    genre_ids.append(int(raw_id))
+                except (TypeError, ValueError):
+                    continue
+            genre_names = [
+                _MAL_GENRE_NAME_BY_ID[g]
+                for g in genre_ids
+                if g in _MAL_GENRE_NAME_BY_ID
+            ]
+            if genre_names:
+                genre_query = ", ".join(f'"{name}"' for name in genre_names)
+                query = f"""
+                  query($page:Int,$perPage:Int){{
+                    Page(page:$page, perPage:$perPage){{
+                      media(type:ANIME, isAdult:false, sort:[SCORE_DESC], genre_in:[{genre_query}]) {{
+                        {ANILIST_MEDIA_FRAGMENT}
+                      }}
+                    }}
+                  }}"""
+                res = await _anilist_query(query, {"page": page, "perPage": limit})
+                if res:
+                    media = (((res.get("data") or {}).get("Page") or {}).get("media") or [])
+                    return {"data": [m for m in (_anilist_to_jikan_anime(x) for x in media) if m]}
             data = await _anilist_list(["SCORE_DESC"], per_page=limit, page=page)
             if data is not None:
                 return {"data": data}
@@ -1909,6 +1991,13 @@ class StreamOut(BaseModel):
     title: Optional[str] = None
 
 
+class StreamOptionsOut(BaseModel):
+    mal_id: int
+    has_dub: bool
+    has_uncensored: bool
+    uncensored_mal_id: Optional[int] = None
+
+
 async def _probe_stream_url(url: str) -> bool:
     try:
         async with httpx.AsyncClient(timeout=4.0, follow_redirects=True) as http:
@@ -1916,6 +2005,95 @@ async def _probe_stream_url(url: str) -> bool:
         return 200 <= res.status_code < 400
     except Exception:
         return False
+
+
+async def _jikan_search_mal_candidates(title: str, limit: int = 10) -> List[int]:
+    clean = (title or "").strip()
+    if not clean:
+        return []
+    try:
+        async with httpx.AsyncClient(timeout=10.0,
+                                     headers={"User-Agent": "Lumen/1.0"}) as http:
+            r = await http.get(f"{JIKAN_BASE}/anime", params={
+                "q": clean,
+                "limit": max(1, min(limit, 25)),
+                "sfw": "true",
+            })
+        if r.status_code != 200:
+            return []
+        body = r.json()
+        rows = body.get("data") if isinstance(body, dict) else []
+        out: List[int] = []
+        for row in rows or []:
+            mid = row.get("mal_id")
+            try:
+                mid_int = int(mid)
+            except (TypeError, ValueError):
+                continue
+            if mid_int > 0:
+                out.append(mid_int)
+        # preserve order while deduplicating
+        seen = set()
+        dedup: List[int] = []
+        for mid in out:
+            if mid in seen:
+                continue
+            seen.add(mid)
+            dedup.append(mid)
+        return dedup
+    except Exception:
+        return []
+
+
+async def _resolve_uncensored_mal_id(mal_id: int, title: Optional[str] = None) -> Optional[int]:
+    key = f"stream:uncensored:{mal_id}"
+    cached = await _cache_get(key)
+    if isinstance(cached, dict) and "uncensored_mal_id" in cached:
+        v = cached.get("uncensored_mal_id")
+        return int(v) if isinstance(v, int) and v > 0 else None
+
+    base_title = (title or "").strip()
+    if not base_title:
+        full = await _jikan_title(mal_id)
+        if full:
+            base_title = (full.get("title_english") or full.get("title") or "").strip()
+    if not base_title:
+        await _cache_set(key, {"uncensored_mal_id": None}, ttl_seconds=6 * 3600)
+        return None
+
+    candidates = await _jikan_search_mal_candidates(f"{base_title} uncensored", limit=8)
+    uncensored_id = next((mid for mid in candidates if mid != mal_id), None)
+    await _cache_set(key, {"uncensored_mal_id": uncensored_id}, ttl_seconds=6 * 3600)
+    return uncensored_id
+
+
+async def _resolve_best_stream(mal_id: int, ep: int, lang: str, anikoto_id: Optional[int] = None) -> Optional[StreamOut]:
+    lang_order = [lang] if lang == "sub" else ["dub", "sub"]
+
+    # First, direct MAL stream with language fallback.
+    for candidate_lang in lang_order:
+        url = f"{MEGAPLAY_BASE}/stream/mal/{mal_id}/{ep}/{candidate_lang}"
+        if await _probe_stream_url(url):
+            return StreamOut(embed_url=url, source="mal", mal_id=mal_id, episode=ep, lang=candidate_lang)
+
+    # Then, Anikoto fallback with language fallback.
+    aid = anikoto_id
+    if not aid:
+        try:
+            resolved = await anikoto_resolve(mal_id)
+            aid = resolved.get("anikoto_id") if isinstance(resolved, dict) else None
+        except Exception:
+            aid = None
+    if aid:
+        for candidate_lang in lang_order:
+            try:
+                candidate = await _build_anikoto_stream(mal_id, ep, candidate_lang, int(aid))
+                if await _probe_stream_url(candidate.embed_url):
+                    return candidate
+            except Exception:
+                continue
+
+    return None
 
 
 async def _build_anikoto_stream(mal_id: int, ep: int, lang: str, anikoto_id: int) -> StreamOut:
@@ -1954,7 +2132,9 @@ async def _build_anikoto_stream(mal_id: int, ep: int, lang: str, anikoto_id: int
 
 @api_router.get("/stream", response_model=StreamOut)
 async def get_stream(mal_id: int, ep: int = 1, lang: str = "sub",
-                     source: str = "mal", anikoto_id: Optional[int] = None):
+                     source: str = "mal", anikoto_id: Optional[int] = None,
+                     title: Optional[str] = None,
+                     version: Optional[str] = "default"):
     lang = (lang or "sub").lower()
     if lang not in ("sub", "dub"):
         raise HTTPException(status_code=400, detail="lang must be sub or dub")
@@ -1963,29 +2143,83 @@ async def get_stream(mal_id: int, ep: int = 1, lang: str = "sub",
     if await db.banned_anime.find_one({"mal_id": mal_id}):
         raise HTTPException(status_code=403, detail="This title is unavailable")
 
+    target_mal_id = mal_id
+    requested_version = (version or "default").strip().lower()
+    if requested_version == "uncensored":
+        uncensored_id = await _resolve_uncensored_mal_id(mal_id, title)
+        if uncensored_id:
+            target_mal_id = uncensored_id
+
     if source == "mal":
-        url = f"{MEGAPLAY_BASE}/stream/mal/{mal_id}/{ep}/{lang}"
-        if await _probe_stream_url(url):
-            return StreamOut(embed_url=url, source="mal", mal_id=mal_id, episode=ep, lang=lang)
-        
-        # MAL probe failed, try Anikoto fallback
-        try:
-            resolved = await anikoto_resolve(mal_id)
-            aid = resolved.get("anikoto_id") if isinstance(resolved, dict) else None
-            if aid:
-                return await _build_anikoto_stream(mal_id, ep, lang, int(aid))
-        except Exception as e:
-            logger.info(f"Anikoto fallback failed for mal_id={mal_id} ep={ep}: {e}")
-        
-        # Both failed, return MAL URL anyway (browser will show proper error)
-        return StreamOut(embed_url=url, source="mal", mal_id=mal_id, episode=ep, lang=lang)
+        primary = await _resolve_best_stream(target_mal_id, ep, lang, anikoto_id=anikoto_id)
+        if primary:
+            return primary
+
+        # If current MAL ID doesn't resolve, try title-based candidate IDs.
+        candidates = await _jikan_search_mal_candidates(title or "", limit=12)
+        for candidate_id in candidates:
+            if candidate_id in (mal_id, target_mal_id):
+                continue
+            candidate_stream = await _resolve_best_stream(candidate_id, ep, lang)
+            if candidate_stream:
+                logger.info("Stream fallback used alternative mal_id=%s for requested mal_id=%s", candidate_id, mal_id)
+                return candidate_stream
+
+        raise HTTPException(status_code=404, detail="No playable source found for this episode")
 
     if source == "anikoto":
         if not anikoto_id:
             raise HTTPException(status_code=400, detail="anikoto_id required for anikoto source")
-        return await _build_anikoto_stream(mal_id, ep, lang, anikoto_id)
+        # For dub requests, gracefully fallback to sub if dub isn't available.
+        if lang == "dub":
+            try:
+                dub_stream = await _build_anikoto_stream(mal_id, ep, "dub", anikoto_id)
+                if await _probe_stream_url(dub_stream.embed_url):
+                    return dub_stream
+            except Exception:
+                pass
+            sub_stream = await _build_anikoto_stream(mal_id, ep, "sub", anikoto_id)
+            if await _probe_stream_url(sub_stream.embed_url):
+                return sub_stream
+            raise HTTPException(status_code=404, detail="No playable source found for this episode")
+        stream = await _build_anikoto_stream(mal_id, ep, lang, anikoto_id)
+        if await _probe_stream_url(stream.embed_url):
+            return stream
+        raise HTTPException(status_code=404, detail="No playable source found for this episode")
 
     raise HTTPException(status_code=400, detail="Unknown source")
+
+
+@api_router.get("/stream/options", response_model=StreamOptionsOut)
+async def stream_options(mal_id: int, title: Optional[str] = None):
+    sub_url = f"{MEGAPLAY_BASE}/stream/mal/{mal_id}/1/sub"
+    dub_url = f"{MEGAPLAY_BASE}/stream/mal/{mal_id}/1/dub"
+    has_dub = await _probe_stream_url(dub_url)
+    if not has_dub:
+        # Try a lighter hint from Anikoto if MAL dub probe fails.
+        try:
+            resolved = await anikoto_resolve(mal_id)
+            aid = resolved.get("anikoto_id") if isinstance(resolved, dict) else None
+            if aid:
+                candidate = await _build_anikoto_stream(mal_id, 1, "dub", int(aid))
+                has_dub = await _probe_stream_url(candidate.embed_url)
+        except Exception:
+            has_dub = False
+
+    # Keep sub probe as a sanity check warm-up for cache/proxy.
+    await _probe_stream_url(sub_url)
+
+    uncensored_id = await _resolve_uncensored_mal_id(mal_id, title)
+    has_uncensored = False
+    if uncensored_id:
+        has_uncensored = await _probe_stream_url(f"{MEGAPLAY_BASE}/stream/mal/{uncensored_id}/1/sub")
+
+    return StreamOptionsOut(
+        mal_id=mal_id,
+        has_dub=has_dub,
+        has_uncensored=has_uncensored,
+        uncensored_mal_id=uncensored_id if has_uncensored else None,
+    )
 
 
 @api_router.post("/reports/stream", response_model=ReportOut)
