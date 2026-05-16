@@ -648,10 +648,13 @@ async def _load_comment_rows(
             try:
                 created_at = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
             except Exception:
-                created_at = datetime.min
+                created_at = None
         if not isinstance(created_at, datetime):
-            created_at = datetime.min
-        return created_at
+            return 0.0
+        try:
+            return float(created_at.timestamp())
+        except Exception:
+            return 0.0
 
     rows.sort(key=_sort_key, reverse=True)
     return rows
@@ -1321,6 +1324,43 @@ async def admin_stats(_: AuthedUser = Depends(require_admin)):
 async def admin_list_users(_: AuthedUser = Depends(require_admin)):
     """Return users seen via comments/ratings + banned status."""
     seen: Dict[str, Dict[str, Any]] = {}
+
+    if SUPABASE_SERVICE:
+        try:
+            sup_profiles = await asyncio.to_thread(lambda: SUPABASE_SERVICE.table('profiles').select('user_id,display_name,mal_username').limit(5000).execute())
+            for p in (sup_profiles.data or []):
+                uid = p.get("user_id")
+                if not uid:
+                    continue
+                seen[uid] = {
+                    "user_id": uid,
+                    "name": p.get("display_name") or p.get("mal_username") or seen.get(uid, {}).get("name", ""),
+                    "comments": seen.get(uid, {}).get("comments", 0),
+                    "ratings": seen.get(uid, {}).get("ratings", 0),
+                }
+
+            sup_comments = await asyncio.to_thread(lambda: SUPABASE_SERVICE.table('comments').select('user_id,user_name').limit(5000).execute())
+            for r in (sup_comments.data or []):
+                uid = r.get("user_id")
+                if not uid:
+                    continue
+                if uid not in seen:
+                    seen[uid] = {"user_id": uid, "name": r.get("user_name", ""), "comments": 0, "ratings": 0}
+                seen[uid]["comments"] = seen[uid].get("comments", 0) + 1
+                if not seen[uid].get("name") and r.get("user_name"):
+                    seen[uid]["name"] = r.get("user_name")
+
+            sup_ratings = await asyncio.to_thread(lambda: SUPABASE_SERVICE.table('ratings').select('user_id').limit(5000).execute())
+            for r in (sup_ratings.data or []):
+                uid = r.get("user_id")
+                if not uid:
+                    continue
+                if uid not in seen:
+                    seen[uid] = {"user_id": uid, "name": "", "comments": 0, "ratings": 0}
+                seen[uid]["ratings"] = seen[uid].get("ratings", 0) + 1
+        except Exception as e:
+            logger.info(f"Supabase read for admin users failed: {e}")
+
     profiles_rows = await db.profiles.find({}, limit=None)
     for p in profiles_rows:
         uid = p.get("user_id")
@@ -1361,7 +1401,39 @@ async def admin_list_users(_: AuthedUser = Depends(require_admin)):
 
 @api_router.get("/admin/ratings")
 async def admin_list_ratings(_: AuthedUser = Depends(require_admin)):
-    rows = await db.ratings.find({}, sort=[("updated_at", -1)], limit=1000)
+    merged: Dict[str, Dict[str, Any]] = {}
+
+    if SUPABASE_SERVICE:
+        try:
+            sup_rows = await asyncio.to_thread(lambda: SUPABASE_SERVICE.table('ratings').select('id,user_id,mal_id,score,created_at,updated_at').order('updated_at', desc=True).limit(2000).execute())
+            for r in (sup_rows.data or []):
+                rid = r.get("id") or f"{r.get('user_id')}:{r.get('mal_id')}"
+                merged[str(rid)] = {
+                    "id": r.get("id"),
+                    "user_id": r.get("user_id"),
+                    "mal_id": r.get("mal_id"),
+                    "score": r.get("score"),
+                    "created_at": r.get("created_at"),
+                    "updated_at": r.get("updated_at"),
+                }
+        except Exception as e:
+            logger.info(f"Supabase read for admin ratings failed: {e}")
+
+    rows = await db.ratings.find({}, sort=[("updated_at", -1)], limit=2000)
+    for r in rows:
+        rid = r.get("id") or f"{r.get('user_id')}:{r.get('mal_id')}"
+        merged.setdefault(str(rid), {
+            "id": r.get("id"),
+            "user_id": r.get("user_id"),
+            "mal_id": r.get("mal_id"),
+            "score": r.get("score"),
+            "created_at": r.get("created_at"),
+            "updated_at": r.get("updated_at"),
+        })
+
+    out = list(merged.values())
+    out.sort(key=lambda r: str(r.get("updated_at") or r.get("created_at") or ""), reverse=True)
+    out = out[:1000]
     return [{
         "id": r.get("id"),
         "user_id": r.get("user_id"),
@@ -1369,7 +1441,7 @@ async def admin_list_ratings(_: AuthedUser = Depends(require_admin)):
         "score": r.get("score"),
         "created_at": r.get("created_at"),
         "updated_at": r.get("updated_at"),
-    } for r in rows]
+    } for r in out]
 
 
 @api_router.get("/admin/flags")
